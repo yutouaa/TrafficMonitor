@@ -1,0 +1,10 @@
+/build/
+*.dll
+*.exe
+*.exp
+*.lib
+*.obj
+*.res
+__pycache__/
+/taskbar_verify*.png
+profile-binding.json

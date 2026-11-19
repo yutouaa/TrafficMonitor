@@ -1,0 +1,17 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "options_resource.h"
+
+IDD_VPN_OPTIONS DIALOGEX 0, 0, 272, 108
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "VPN 监控设置"
+FONT 9, "Microsoft YaHei UI"
+BEGIN
+    LTEXT           "恢复目标节点(&N)", -1, 8, 12, 74, 10
+    COMBOBOX        IDC_VPN_TARGET, 82, 10, 182, 95, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "刷新间隔(&R)", -1, 8, 35, 74, 10
+    COMBOBOX        IDC_VPN_REFRESH, 82, 33, 75, 77, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "", IDC_VPN_STATUS, 8, 57, 256, 14
+    DEFPUSHBUTTON   "确定", IDOK, 160, 84, 49, 15
+    PUSHBUTTON      "取消", IDCANCEL, 215, 84, 49, 15
+END

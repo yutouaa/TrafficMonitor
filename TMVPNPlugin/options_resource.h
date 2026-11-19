@@ -1,0 +1,6 @@
+#pragma once
+
+#define IDD_VPN_OPTIONS 101
+#define IDC_VPN_TARGET 1001
+#define IDC_VPN_REFRESH 1002
+#define IDC_VPN_STATUS 1003
