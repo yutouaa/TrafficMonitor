@@ -1,6 +1,7 @@
 ﻿param(
     [Parameter(Mandatory = $true)][ValidateSet('probe', 'snapshot', 'prepare', 'protect', 'update', 'restore')][string]$Action,
-    [Parameter(Mandatory = $true)][string]$ProfileName,
+    [string]$ProfileNameBase64 = '',
+    [string]$ExpectedProfilesHash = '',
     [string]$SnapshotJson = ''
 )
 
@@ -18,7 +19,19 @@ function Fail([string]$Code, [string]$Message) {
     throw $failure
 }
 
+function Check-ProfileIdentity {
+    if (-not $ExpectedProfilesHash) { return }
+    $path = Join-Path $env:APPDATA 'io.github.clash-verge-rev.clash-verge-rev\profiles.yaml'
+    try {
+        $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    } catch {
+        Fail 'user_takeover' '无法确认当前订阅，停止界面操作。'
+    }
+    if ($actual -ine $ExpectedProfilesHash) { Fail 'user_takeover' '订阅信息已变化，停止界面操作。' }
+}
+
 try {
+    $ProfileName = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ProfileNameBase64))
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
     Add-Type -TypeDefinition @'
 using System;
@@ -198,13 +211,14 @@ public static class GuardWindow {
     }
 
     function Profile-Titles {
+        if (-not $ProfileName) { return }
         $matches = @(Find-Named (Root) $ProfileName $null)
         foreach ($candidate in $matches) {
             $parent = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($candidate)
             $nested = $false
             for ($level = 0; $null -ne $parent -and $level -lt 16; $level++) {
                 if ($parent.Current.ControlType -eq [System.Windows.Automation.ControlType]::Window) { break }
-                if ($parent.Current.Name -eq $ProfileName) { $nested = $true; break }
+                if ($parent.Current.Name -ceq $ProfileName) { $nested = $true; break }
                 $parent = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($parent)
             }
             if (-not $nested) { $candidate }
@@ -464,6 +478,7 @@ public static class GuardWindow {
             Fail 'network_switch_unavailable' '网络开关当前不可操作，停止本次恢复。'
         }
         Check-Interactive
+        Check-ProfileIdentity
         $controlInfo.pattern.Toggle()
         $deadline = [DateTime]::UtcNow.AddSeconds(15)
         while ([DateTime]::UtcNow -lt $deadline) {
@@ -499,11 +514,13 @@ public static class GuardWindow {
             }
         }
         'prepare' {
+            Check-ProfileIdentity
             $previous = [GuardWindow]::GetForegroundWindow()
             $previousPid = [GuardWindow]::Pid($previous)
             Prepare-Window
             Navigate 'profile'
             $card = Wait-Card
+            Check-ProfileIdentity
             if (-not $card.refresh.Current.IsEnabled) { Fail 'update_busy' '该订阅正在更新，稍后重试。' }
             $result.handoff = @{
                 hwnd = $script:Hwnd.ToInt64().ToString()
@@ -514,6 +531,7 @@ public static class GuardWindow {
             }
         }
         'protect' {
+            Check-ProfileIdentity
             Prepare-Window
             Navigate 'settings'
             Enable-NetworkSwitch '虚拟网卡模式'
@@ -522,6 +540,7 @@ public static class GuardWindow {
             $result.system_proxy_enabled = $true
         }
         'update' {
+            Check-ProfileIdentity
             Resume-PreparedWindow $SnapshotJson
             $card = Wait-Card
             if (-not $card.refresh.Current.IsEnabled) { Fail 'update_busy' '该订阅正在更新，稍后重试。' }
@@ -529,6 +548,7 @@ public static class GuardWindow {
             $rectangle = $card.header.Current.BoundingRectangle
             if ($rectangle.IsEmpty -or $card.header.Current.IsOffscreen) { Fail 'profile_offscreen' '指定订阅不在当前可见区域。' }
             Check-Interactive
+            Check-ProfileIdentity
             $script:PreparedInput = $null # 鼠标点击本身会更新输入时间；之后只观察这次更新。
             if (-not [GuardWindow]::RightClick($script:Hwnd, [int]($rectangle.X + $rectangle.Width / 2), [int]($rectangle.Y + $rectangle.Height / 2))) {
                 Fail 'context_menu_failed' '无法安全打开指定订阅菜单。'
@@ -541,6 +561,7 @@ public static class GuardWindow {
                 $menus = @(Find-Named (Root) '更新（代理）' ([System.Windows.Automation.ControlType]::MenuItem))
                 if ($menus.Count -gt 1) { Fail 'ambiguous_menu' '无法唯一确认代理更新菜单。' }
                 if ($menus.Count -eq 1) {
+                    Check-ProfileIdentity
                     Invoke-Element $menus[0] -Passive
                     $invoked = $true
                     $script:UpdateInvoked = $true

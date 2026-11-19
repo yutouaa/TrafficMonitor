@@ -18,11 +18,37 @@ class PluginSettingsTest(unittest.TestCase):
     def setUp(self):
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.object(guard, "INSTALL_DIR", self.directory))
+        self.enterContext(patch.object(guard, "PROFILE_ROOT", self.directory))
+        self.enterContext(patch.object(guard, "STATE_PATH", self.directory / "state.json"))
         self.settings_path = self.directory / "plugin-settings.json"
+        self.profiles_path = self.directory / "profiles.yaml"
+        self.profiles()
 
-    def settings(self, target, interval):
-        self.settings_path.write_text(json.dumps({"target_node": target, "refresh_seconds": interval}),
-                                      encoding="utf-8")
+    def settings(self, target, interval, **extra):
+        self.settings_path.write_text(json.dumps({"target_node": target, "refresh_seconds": interval, **extra}), encoding="utf-8")
+
+    def profiles(self, current="fixture_primary", secondary_name="Second: Team", primary_name="测试订阅"):
+        # Use actual block-style YAML, including quoting, Unicode and a private field.
+        self.profiles_path.write_text(f"""current: '{current}'
+items:
+- uid: fixture_primary
+  type: remote
+  name: {json.dumps(primary_name, ensure_ascii=False)}
+  url: https://example.invalid/?private-test-token
+- uid: second
+  type: remote
+  name: {json.dumps(secondary_name, ensure_ascii=False)}
+- uid: local
+  type: local
+  name: '本地配置'
+- uid: merge
+  type: merge
+""", encoding="utf-8-sig")
+
+    def world(self):
+        world = World(self)
+        self.add_proxy(world, guard.BOOTSTRAP, "Vless")
+        return world
 
     @staticmethod
     def add_proxy(world, name, protocol, *, member=True):
@@ -44,10 +70,17 @@ class PluginSettingsTest(unittest.TestCase):
         return Host()
 
     def test_settings_defaults_and_validation(self):
-        self.assertEqual(guard.load_plugin_settings(), (guard.TARGET, 10))
+        self.assertEqual(guard.load_plugin_settings(), (guard.TARGET, 10, None))
         for interval in guard.REFRESH_INTERVALS:
             self.settings("日本备用节点", interval)
-            self.assertEqual(guard.load_plugin_settings(), ("日本备用节点", interval))
+            self.assertEqual(guard.load_plugin_settings(), ("日本备用节点", interval, None))
+        for uid in ("second", ""):
+            self.settings(guard.TARGET, 10, profile_uid=uid)
+            self.assertEqual(guard.load_plugin_settings(), (guard.TARGET, 10, uid))
+        for uid in (None, 42, "订阅", "../second", "a" * 129):
+            self.settings(guard.TARGET, 10, profile_uid=uid)
+            with self.assertRaisesRegex(guard.GuardError, "恢复设置"):
+                guard.load_plugin_settings()
         for target, interval in ((guard.BOOTSTRAP, 10), ("direct", 10), ("GLOBAL", 10),
                                  ("节点\n", 10), ("节点\u3000", 10), ("节" * 171, 10),
                                  ("节点", 2), ("节点", 10.0), ("节点", True)):
@@ -69,7 +102,7 @@ class PluginSettingsTest(unittest.TestCase):
         self.assertEqual(guard.load_profile_binding(), ("fixture_123", "示例订阅"))
 
     def test_interval_change_reschedules_from_last_start(self):
-        world = World(self)
+        world = self.world()
         self.settings(guard.TARGET, 30)
         starts = []
         def tick(_state):
@@ -85,7 +118,7 @@ class PluginSettingsTest(unittest.TestCase):
         self.assertEqual(starts, [0, 5, 20])
 
     def test_config_change_keeps_running_recovery_snapshot_and_healthy_selection(self):
-        world = World(self)
+        world = self.world()
         alternate = "配置的日本节点"
         next_target = "下一轮目标"
         self.add_proxy(world, alternate, "Vless")
@@ -106,7 +139,7 @@ class PluginSettingsTest(unittest.TestCase):
         self.assertEqual(world.state["last_result"], "paused_selection")
 
     def test_settings_change_waits_for_interrupted_rollback_and_preserves_cooldown(self):
-        world = World(self)
+        world = self.world()
         alternate = "新目标"
         self.settings(alternate, 5)
         world.context["selected"] = guard.BOOTSTRAP
@@ -127,7 +160,7 @@ class PluginSettingsTest(unittest.TestCase):
         self.assertEqual(world.state["last_result"], "paused_selection")
 
     def test_invalid_settings_pause_new_checks_but_not_interrupted_rollback(self):
-        world = World(self)
+        world = self.world()
         self.settings_path.write_text("{", encoding="utf-8")
         world.context["selected"] = guard.BOOTSTRAP
         world.state["transaction"] = {"original": guard.TARGET, "expected": guard.BOOTSTRAP}
@@ -139,7 +172,7 @@ class PluginSettingsTest(unittest.TestCase):
         self.assertEqual(world.state["last_result"], "plugin_settings_invalid")
 
     def test_configured_group_cannot_be_recovered(self):
-        world = World(self)
+        world = self.world()
         self.settings("新目标", 5)
         world.context["selected"] = "新目标"
         self.add_proxy(world, "新目标", "Selector")
@@ -148,7 +181,7 @@ class PluginSettingsTest(unittest.TestCase):
         world.assert_not_changed()
 
     def test_target_replaced_by_group_is_not_restored_on_rollback(self):
-        world = World(self)
+        world = self.world()
         alternate = "原代理节点"
         self.settings(alternate, 5)
         world.context["selected"] = alternate
@@ -165,7 +198,7 @@ class PluginSettingsTest(unittest.TestCase):
         self.assertIsNone(world.state["transaction"])
 
     def test_target_outside_global_waits_for_reload_before_switching(self):
-        world = World(self)
+        world = self.world()
         alternate = "恢复目标"
         self.settings(alternate, 5)
         world.context["selected"] = alternate
@@ -186,7 +219,7 @@ class PluginSettingsTest(unittest.TestCase):
         self.assertEqual(world.state["last_result"], "network_restored")
 
     def test_invalid_global_group_is_not_treated_as_a_missing_target(self):
-        world = World(self)
+        world = self.world()
         self.settings(guard.TARGET, 5)
         self.add_proxy(world, guard.TARGET, "Vless")
         world.context["proxies"]["GLOBAL"]["type"] = "URLTest"
@@ -195,7 +228,7 @@ class PluginSettingsTest(unittest.TestCase):
         world.assert_not_changed()
 
     def test_unlisted_original_plugin_target_rolls_back_to_reject_after_restart(self):
-        world = World(self)
+        world = self.world()
         alternate = "原代理节点"
         self.settings(guard.TARGET, 5)
         world.context["selected"] = guard.BOOTSTRAP
@@ -205,6 +238,102 @@ class PluginSettingsTest(unittest.TestCase):
         guard.watch_loop(world.state, self.host_until(world, 1))
         world.select.assert_called_once_with("REJECT")
         self.assertIsNone(world.state["transaction"])
+
+    def test_paused_catalog_uses_actual_yaml_and_omits_private_fields(self):
+        world = self.world()
+        (self.directory / "monitor.pause").touch()
+        self.profiles(primary_name="本地配置")
+        with patch.object(guard, "publish_profile_catalog", wraps=guard.publish_profile_catalog) as publish:
+            guard.watch_loop(world.state, self.host_until(world, 3))
+        publish.assert_called_once()
+        data = (self.directory / "profile-catalog.json").read_text(encoding="utf-8")
+        self.assertNotIn("private-test-token", data)
+        self.assertEqual(json.loads(data), {"available": True, "current": "fixture_primary", "selected": "fixture_primary",
+            "items": [{"uid": "fixture_primary", "name": "本地配置", "ambiguous": True},
+                      {"uid": "second", "name": "Second: Team", "ambiguous": False}]})
+        world.assert_not_changed()
+
+    def test_explicit_unbound_ambiguous_and_missing_profiles_do_not_recover(self):
+        world = self.world()
+        for uid, name, result in (("", "second name", "profile_unbound"),
+                                  ("fixture_primary", "测试订阅", "ambiguous_profile"),
+                                  ("unknown", "second name", "profile_not_found")):
+            self.settings(guard.TARGET, 5, profile_uid=uid)
+            self.profiles(secondary_name=name)
+            guard.watch_loop(world.state, self.host_until(world, world.now + 1))
+            self.assertEqual(world.state["last_result"], result)
+        world.assert_not_changed()
+
+    def test_inactive_subscription_remains_untouched_until_applied(self):
+        world = self.world()
+        self.settings(guard.TARGET, 5, profile_uid="second")
+        world.state.update(failures=2, owned_reject=True)
+        world.state["pending_reload"] = {"selected": guard.TARGET, "profile_stamp": [90, 10], "until": 1030}
+        guard.watch_loop(world.state, self.host_until(world, 1))
+        self.assertEqual(world.state["last_result"], "paused_scope")
+        self.assertEqual(world.state["failures"], 0)
+        self.assertNotIn("pending_reload", world.state)
+        world.assert_not_changed()
+        self.profiles(current="second")
+        world.context["profile_uid"] = "second"
+        self.add_proxy(world, guard.TARGET, "Vless")
+        guard.watch_loop(world.state, self.host_until(world, 2))
+        self.assertEqual(world.state["last_result"], "healthy")
+
+    def test_subscription_update_uses_frozen_uid_and_new_name_after_rename(self):
+        world = self.world()
+        self.profiles(current="second", secondary_name='-团队 "订阅"')
+        self.settings(guard.TARGET, 5, profile_uid="second")
+        world.context["profile_uid"] = "second"
+        self.add_proxy(world, guard.TARGET, "Vless")
+        world.health[guard.TARGET] = False
+        def update():
+            self.assertEqual(guard.bound_profile(), ("second", '-团队 "订阅"'))
+            self.assertEqual(world.state["transaction"]["profile_uid"], "second")
+            self.settings(guard.TARGET, 5, profile_uid="fixture_primary")
+            world.stamp = (200, 10)
+            world.health[guard.TARGET] = True
+            return {"invoked": True, "finished": True}
+        world.update_hook = update
+        guard.watch_loop(world.state, self.host_until(world, 11))
+        self.assertEqual([call.args[0] for call in world.select.call_args_list], [guard.BOOTSTRAP, guard.TARGET])
+        self.assertEqual(world.state["last_result"], "paused_scope")
+
+    def test_interruption_cannot_rollback_to_different_subscription_even_if_node_matches(self):
+        world = self.world()
+        self.profiles(current="second")
+        self.settings(guard.TARGET, 5, profile_uid="second")
+        world.context.update(profile_uid="second", selected=guard.BOOTSTRAP)
+        world.state["transaction"] = {"original": guard.TARGET, "expected": guard.BOOTSTRAP,
+                                      "profile_uid": "fixture_primary"}
+        guard.watch_loop(world.state, self.host_until(world, 1))
+        world.assert_not_changed()
+        self.assertIsNone(world.state["transaction"])
+
+    def test_no_usable_an_does_not_close_claude_in_reloading_branch(self):
+        world = self.world()
+        self.settings(guard.TARGET, 5)
+        self.add_proxy(world, guard.TARGET, "Vless")
+        world.context["proxies"]["GLOBAL"]["all"].remove(guard.BOOTSTRAP)
+        world.health[guard.TARGET] = False
+        world.state["pending_reload"] = {"selected": guard.TARGET, "profile_stamp": [100, 10], "until": 1000}
+        guard.watch_loop(world.state, self.host_until(world, 1))
+        self.assertEqual(world.state["last_result"], "bootstrap_missing")
+        world.assert_not_changed()
+
+    def test_fresh_metadata_check_blocks_stale_scope_before_closing_claude(self):
+        world = self.world()
+        self.settings(guard.TARGET, 5)
+        self.add_proxy(world, guard.TARGET, "Vless")
+        world.context["proxies"].pop(guard.TARGET)
+        def changed_after_inspect(action, *args, **kwargs):
+            if action == "probe":
+                self.profiles(secondary_name="测试订阅")
+            return world.ui_action(action, *args, **kwargs)
+        world.ui.side_effect = changed_after_inspect
+        guard.watch_loop(world.state, self.host_until(world, 1))
+        self.assertEqual(world.state["last_result"], "ambiguous_profile")
+        world.assert_not_changed()
 
 
 class PluginWatchTest(unittest.TestCase):
@@ -226,6 +355,7 @@ class PluginWatchTest(unittest.TestCase):
                 return "healthy"
             with patch.object(guard, "INSTALL_DIR", directory), \
                     patch.object(guard, "save_state"), \
+                    patch.object(guard, "profile_catalog_view", return_value=({"available": True}, ("fixture_primary", "Fixture"))), \
                     patch.object(guard, "watch_tick", side_effect=tick) as automatic, \
                     patch.object(guard, "recover") as manual:
                 guard.watch_loop(state, host)

@@ -1,4 +1,4 @@
-"""Clash Verge 当前订阅自动恢复；仅使用 Python 标准库。"""
+"""Clash Verge 当前订阅自动恢复。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from contextlib import ExitStack
 from contextvars import ContextVar
 import ctypes
 from ctypes import wintypes
+import hashlib
 import http.client
 import json
 import logging
@@ -48,7 +49,12 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 REQUEST_DEADLINE = ContextVar("request_deadline", default=None)
 AUTO_ACTION_ALLOWED = ContextVar("auto_action_allowed", default=None)
 PLUGIN_TARGET = ContextVar("plugin_target", default=None)
+BOUND_PROFILE = ContextVar("bound_profile", default=None)
 REPORT_PATH: Path | None = None
+
+
+def valid_profile_uid(uid) -> bool:
+    return isinstance(uid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", uid) is not None
 
 
 def load_profile_binding() -> tuple[str, str]:
@@ -59,7 +65,7 @@ def load_profile_binding() -> tuple[str, str]:
             data = json.loads(raw.decode("utf-8-sig"))
             if isinstance(data, dict):
                 uid, name = data.get("profile_uid"), data.get("profile_name")
-                if (isinstance(uid, str) and re.fullmatch(r"[A-Za-z0-9_-]+", uid)
+                if (valid_profile_uid(uid)
                         and isinstance(name, str) and name.strip() and "\0" not in name):
                     return uid, name
     except (OSError, ValueError, RecursionError):
@@ -68,6 +74,10 @@ def load_profile_binding() -> tuple[str, str]:
 
 
 PROFILE_UID, PROFILE_NAME = load_profile_binding()
+
+
+def bound_profile() -> tuple[str, str]:
+    return BOUND_PROFILE.get() or (PROFILE_UID, PROFILE_NAME)
 
 
 class GuardError(Exception):
@@ -108,26 +118,135 @@ def emit(data: dict) -> None:
         print(json.dumps(data, ensure_ascii=False))
 
 
-def load_plugin_settings() -> tuple[str, int]:
+def load_plugin_settings() -> tuple[str, int, str | None]:
     try:
         with (INSTALL_DIR / "plugin-settings.json").open("rb") as stream:
             raw = stream.read(4097)
         if len(raw) > 4096:
             raise ValueError()
         data = json.loads(raw.decode("utf-8"))
-        if not isinstance(data, dict) or data.keys() != {"target_node", "refresh_seconds"}:
+        if not isinstance(data, dict) or data.keys() not in ({"target_node", "refresh_seconds"},
+                                                             {"target_node", "refresh_seconds", "profile_uid"}):
             raise ValueError()
         target, seconds = data["target_node"], data["refresh_seconds"]
+        uid = data.get("profile_uid")
         if (not isinstance(target, str) or not 1 <= len(target.encode("utf-8")) <= 512
                 or target != target.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in target)
                 or target.upper() in (BOOTSTRAP.upper(), "DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL")
-                or type(seconds) is not int or seconds not in REFRESH_INTERVALS):
+                or type(seconds) is not int or seconds not in REFRESH_INTERVALS
+                or ("profile_uid" in data and uid != "" and not valid_profile_uid(uid))):
             raise ValueError()
-        return target, seconds
+        return target, seconds, uid
     except FileNotFoundError:
-        return TARGET, CHECK_INTERVAL
-    except (OSError, ValueError):
+        return TARGET, CHECK_INTERVAL, None
+    except (OSError, ValueError, RecursionError):
         raise GuardError("plugin_settings_invalid", "恢复设置无法读取或内容无效，暂停自动恢复") from None
+
+
+def yaml_parser():
+    vendor = SCRIPT_DIR / "vendor"
+    if (vendor / "yaml" / "__init__.py").is_file():
+        sys.path.insert(0, str(vendor))
+        try:
+            import yaml
+        finally:
+            sys.path.pop(0)
+    else:
+        import yaml
+    return yaml
+
+
+def read_profile_catalog() -> tuple[dict, str]:
+    try:
+        yaml = yaml_parser()
+    except ImportError:
+        raise GuardError("profile_reader_missing", "恢复助手缺少订阅解析组件，请重新安装") from None
+
+    class ProfilesLoader(yaml.BaseLoader):
+        def construct_mapping(self, node, deep=False):
+            mapping = super().construct_mapping(node, deep=deep)
+            if len(mapping) != len(node.value):
+                raise ValueError()
+            return mapping
+
+    limit = 2 * 1024 * 1024
+    try:
+        with (PROFILE_ROOT / "profiles.yaml").open("rb") as stream:
+            raw = stream.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError()
+        document = yaml.load(raw.decode("utf-8-sig"), Loader=ProfilesLoader)
+        if not isinstance(document, dict) or not isinstance(document.get("items"), list):
+            raise ValueError()
+        items = []
+        counts = {}
+        uids = set()
+        for item in document["items"]:
+            if not isinstance(item, dict):
+                raise ValueError()
+            if item.get("type") not in ("remote", "local"):
+                continue
+            uid, name = item.get("uid"), item.get("name")
+            if (not valid_profile_uid(uid) or uid in uids or not isinstance(name, str)
+                    or not name.strip() or len(name.encode("utf-8")) > 512
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)):
+                raise ValueError()
+            uids.add(uid)
+            counts[name] = counts.get(name, 0) + 1
+            if item["type"] == "remote":
+                items.append({"uid": uid, "name": name})
+        for item in items:
+            item["ambiguous"] = counts[item["name"]] > 1
+        current = document.get("current")
+        return {"available": True, "current": current if valid_profile_uid(current) else "", "items": items}, hashlib.sha256(raw).hexdigest()
+    except (OSError, ValueError, TypeError, RecursionError, yaml.YAMLError):
+        raise GuardError("profile_unavailable", "无法读取 Clash Verge 订阅列表，已暂停恢复") from None
+
+
+def catalog_binding(catalog: dict, uid: str) -> tuple[str, str]:
+    if not uid:
+        raise GuardError("profile_unbound", "请在插件选项中选择订阅")
+    for item in catalog["items"]:
+        if item["uid"] == uid:
+            if item["ambiguous"]:
+                raise GuardError("ambiguous_profile", "存在同名订阅，请先在 Clash Verge 中改名")
+            return uid, item["name"]
+    raise GuardError("profile_not_found", "已选订阅不在 Clash Verge 中，请重新选择")
+
+
+def profile_catalog_view(uid: str) -> tuple[dict, tuple[str, str] | GuardError]:
+    try:
+        catalog, _ = read_profile_catalog()
+    except GuardError as error:
+        return {"available": False, "current": "", "selected": uid, "items": []}, error
+    catalog["selected"] = uid
+    try:
+        return catalog, catalog_binding(catalog, uid)
+    except GuardError as error:
+        return catalog, error
+
+
+def publish_profile_catalog(catalog: dict) -> None:
+    path = INSTALL_DIR / "profile-catalog.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(catalog, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def profile_catalog_stamp() -> tuple[int, ...] | None:
+    try:
+        info = (PROFILE_ROOT / "profiles.yaml").stat()
+        return info.st_mtime_ns, info.st_ctime_ns, info.st_size, info.st_ino
+    except OSError:
+        return None
+
+
+def verify_profile_binding() -> str:
+    uid, name = bound_profile()
+    catalog, fingerprint = read_profile_catalog()
+    if catalog["current"] != uid or catalog_binding(catalog, uid) != (uid, name):
+        raise GuardError("user_takeover", "订阅已切换或改名，停止界面操作")
+    return fingerprint
 
 
 def supported_plugin_node(context: dict, target: str) -> bool:
@@ -141,6 +260,11 @@ def global_members(group: dict | None) -> list:
     if not isinstance(members, list):
         raise GuardError("global_unavailable", "未能确认内核全局组的可选节点，已停止自动恢复")
     return members
+
+
+def bootstrap_available(context: dict) -> bool:
+    proxies = context["proxies"]
+    return BOOTSTRAP in proxies and (PLUGIN_TARGET.get() is None or BOOTSTRAP in global_members(proxies.get("GLOBAL")))
 
 
 def target_available(context: dict, target: str) -> bool:
@@ -177,9 +301,13 @@ def load_state() -> dict:
         if transaction and any(transaction.get(k) is not None and not isinstance(transaction[k], str)
                                for k in ("pending_selection", "before_selection", "plugin_target")):
             raise ValueError()
+        if transaction and "profile_uid" in transaction and not valid_profile_uid(transaction["profile_uid"]):
+            raise ValueError()
         if saved.get("last_selected") is not None and not isinstance(saved["last_selected"], str):
             raise ValueError()
         if "plugin_target" in saved and not isinstance(saved["plugin_target"], str):
+            raise ValueError()
+        if "plugin_profile_uid" in saved and saved["plugin_profile_uid"] != "" and not valid_profile_uid(saved["plugin_profile_uid"]):
             raise ValueError()
         if type(saved.get("owned_reject", False)) is not bool:
             raise ValueError()
@@ -320,6 +448,10 @@ def require_auto_action_allowed() -> None:
     allowed = AUTO_ACTION_ALLOWED.get()
     if allowed is not None and not allowed():
         raise GuardError("monitor_stopped", "自动恢复已暂停或 TrafficMonitor 已退出")
+    if BOUND_PROFILE.get() is not None:
+        verify_profile_binding()
+        if allowed is not None and not allowed():
+            raise GuardError("monitor_stopped", "自动恢复已暂停或 TrafficMonitor 已退出")
 
 
 def root_scalar(text: str, key: str) -> str:
@@ -352,7 +484,7 @@ def current_profile_uid() -> str:
 
 def profile_stamp() -> tuple[int, int]:
     try:
-        info = (PROFILE_ROOT / "profiles" / (PROFILE_UID + ".yaml")).stat()
+        info = (PROFILE_ROOT / "profiles" / (bound_profile()[0] + ".yaml")).stat()
         return info.st_mtime_ns, info.st_size
     except OSError:
         raise GuardError("profile_unavailable", "当前绑定的订阅文件不存在") from None
@@ -431,8 +563,14 @@ def node_healthy(name: str, urls=HEALTH_URLS, timeout: float = 12) -> bool:
 
 def ui_action(action: str, snapshot=None, timeout: float | None = None) -> dict:
     timeout = remaining_timeout(timeout or (172 if action == "update" else 35))
+    _, name = bound_profile()
     arguments = [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
-                 str(SCRIPT_DIR / "verge_ui.ps1"), "-Action", action, "-ProfileName", PROFILE_NAME]
+                 str(SCRIPT_DIR / "verge_ui.ps1"), "-Action", action]
+    if action in ("prepare", "protect", "update") and BOUND_PROFILE.get() is not None:
+        arguments += ["-ExpectedProfilesHash", verify_profile_binding()]
+    if name:
+        # Encode separately so names starting with '-' and Windows command-line quotes remain literal.
+        arguments += ["-ProfileNameBase64", base64.b64encode(name.encode("utf-8")).decode("ascii")]
     if snapshot is not None:
         arguments += ["-SnapshotJson", json.dumps(snapshot, ensure_ascii=False)]
     try:
@@ -495,12 +633,12 @@ def inspect_context() -> dict:
     if current_profile_uid() != uid:
         raise GuardError("user_takeover", "当前订阅已切换，暂停自动操作")
     return {"profile_uid": uid, "mode": config.get("mode"), "selected": proxies.get("GLOBAL", {}).get("now"),
-            "proxies": proxies, "profile_stamp": list(profile_stamp()) if uid == PROFILE_UID else None,
+            "proxies": proxies, "profile_stamp": list(profile_stamp()) if uid == bound_profile()[0] else None,
             **network_protection_status(config)}
 
 
 def same_scope(context: dict) -> bool:
-    return context["profile_uid"] == PROFILE_UID and context["mode"] == "global"
+    return context["profile_uid"] == bound_profile()[0] and context["mode"] == "global"
 
 
 def check_recovery_context(before: dict, after: dict) -> None:
@@ -550,21 +688,22 @@ def eligible(context: dict, state: dict, allow_unhealthy_selection: bool = False
 
 
 def set_selection(name: str) -> None:
-    if current_profile_uid() != PROFILE_UID or core_request("GET", "/configs").get("mode") != "global":
+    uid, _ = bound_profile()
+    if not uid or current_profile_uid() != uid or core_request("GET", "/configs").get("mode") != "global":
         raise GuardError("user_takeover", "订阅或模式已切换，保留用户当前设置")
     before = {"selected": core_request("GET", "/proxies/GLOBAL").get("now"),
               "profile_stamp": list(profile_stamp())}
     close_claude_desktop()
-    if current_profile_uid() != PROFILE_UID:
+    if current_profile_uid() != uid:
         raise GuardError("user_takeover", "订阅已切换，保留用户当前设置")
     mode = core_request("GET", "/configs").get("mode")
     group = core_request("GET", "/proxies/GLOBAL")
-    after = {"profile_uid": PROFILE_UID, "mode": mode, "selected": group.get("now"),
+    after = {"profile_uid": current_profile_uid(), "mode": mode, "selected": group.get("now"),
              "profile_stamp": list(profile_stamp())}
     if after["selected"] != before["selected"] and after["profile_stamp"] != before["profile_stamp"]:
         after["proxies"] = core_request("GET", "/proxies").get("proxies", {})
     check_recovery_context(before, after)
-    if name == PLUGIN_TARGET.get() and name not in global_members(group):
+    if PLUGIN_TARGET.get() is not None and name in (PLUGIN_TARGET.get(), BOOTSTRAP) and name not in global_members(group):
         raise GuardError("target_missing", "切换前目标节点已不在全局组的可选列表")
     core_request("PUT", "/proxies/GLOBAL", {"name": name})
     selected = core_request("GET", "/proxies/GLOBAL").get("now")
@@ -576,6 +715,19 @@ def rollback(state: dict) -> str:
     transaction = state.get("transaction")
     if not transaction:
         return "nothing_to_restore"
+    uid = transaction.get("profile_uid", PROFILE_UID)
+    if not uid:
+        log_event("unbound_transaction", "旧恢复记录没有可确认的订阅，保留当前节点")
+        state["transaction"] = None
+        return "user_takeover"
+    token = BOUND_PROFILE.set((uid, ""))
+    try:
+        return rollback_selection(state, transaction)
+    finally:
+        BOUND_PROFILE.reset(token)
+
+
+def rollback_selection(state: dict, transaction: dict) -> str:
     context = inspect_context()
     owned = {transaction["expected"], transaction["original"], transaction.get("pending_selection"), transaction.get("before_selection")}
     if not same_scope(context) or context["selected"] not in owned:
@@ -745,6 +897,11 @@ def recover(state: dict, manual: bool = False, unhealthy_selection: bool = False
         fresh = inspect_context()
         check_recovery_context(context, fresh)
         fresh_available = target_available(fresh, target)
+        pending = state.get("pending_reload")
+        reuse_profile = (pending is not None and pending["selected"] == context["selected"]
+                         and fresh_available and network_ready(fresh) and node_healthy(target))
+        if not reuse_profile and not bootstrap_available(fresh):
+            raise GuardError("bootstrap_missing", "当前订阅没有可选的 AN 订阅专用节点")
         require_auto_action_allowed()
         close_claude_desktop()
         snapshot = ui_action("snapshot")
@@ -754,15 +911,12 @@ def recover(state: dict, manual: bool = False, unhealthy_selection: bool = False
         check_recovery_context(context, fresh)
         if context.get("reload_stamp") is not None:
             raise GuardError("profile_reloading", "订阅文件已更新，等待内核应用后重新检查", fresh)
-        pending = state.get("pending_reload")
-        reuse_profile = (pending is not None and pending["selected"] == context["selected"]
-                         and fresh_available and network_ready(fresh) and node_healthy(target))
         original = context["selected"]
         if pending or (not manual and not available and state.get("last_selected") == target):
             original = target
         if not reuse_profile:
-            if BOOTSTRAP not in fresh["proxies"]:
-                raise GuardError("bootstrap_missing", "当前订阅中没有 AN 订阅专用节点")
+            if not bootstrap_available(fresh):
+                raise GuardError("bootstrap_missing", "当前订阅没有可选的 AN 订阅专用节点")
             if not node_healthy("DIRECT", DIRECT_URLS):
                 return "deferred_offline"
             stamp = profile_stamp()
@@ -795,7 +949,7 @@ def recover(state: dict, manual: bool = False, unhealthy_selection: bool = False
             state.pop("last_error_code", None)
             state["transaction"] = {"original": original, "before_selection": context["selected"], "expected": BOOTSTRAP,
                                     "phase": "switching", "started_at": time.time(), "window": snapshot,
-                                    "plugin_target": PLUGIN_TARGET.get()}
+                                    "plugin_target": PLUGIN_TARGET.get(), "profile_uid": bound_profile()[0]}
             save_state(state)
             started = True
             set_selection(BOOTSTRAP)
@@ -857,7 +1011,8 @@ def recover(state: dict, manual: bool = False, unhealthy_selection: bool = False
             state.pop("last_error_code", None)
             state["transaction"] = {"original": original, "before_selection": context["selected"],
                                     "expected": context["selected"], "phase": "selecting_target",
-                                    "started_at": time.time(), "plugin_target": PLUGIN_TARGET.get()}
+                                    "started_at": time.time(), "plugin_target": PLUGIN_TARGET.get(),
+                                    "profile_uid": bound_profile()[0]}
             save_state(state)
             started = True
             log_event("subscription_reloaded", "外部订阅重载后目标节点已连通，直接切换，不重复更新")
@@ -963,7 +1118,7 @@ def watch_tick(state: dict) -> str:
             else:
                 if not ui_action("probe").get("unlocked"):
                     return "deferred_locked"
-                if not cooling_down and (not available or context["selected"] != target):
+                if not cooling_down and bootstrap_available(context) and (not available or context["selected"] != target):
                     require_auto_action_allowed()
                     close_claude_desktop()
                 if context.get("profile_stamp") != pending["profile_stamp"]:
@@ -976,7 +1131,7 @@ def watch_tick(state: dict) -> str:
                 if not pending_ready:
                     if available and context["selected"] == target:
                         state["failures"] = state.get("failures", 0) + 1
-                        if state["failures"] >= 2 and not cooling_down:
+                        if state["failures"] >= 2 and not cooling_down and bootstrap_available(context):
                             require_auto_action_allowed()
                             close_claude_desktop()
                     if time.time() < pending["until"]:
@@ -1181,6 +1336,8 @@ def watch_loop(state: dict, host: PluginHost | None = None) -> None:
     last_started = None
     previous_status = None
     previous_paused = None
+    previous_catalog = None
+    catalog_key = None
     pause_status = "自动恢复已暂停，延迟显示仍刷新" if host else "自动检查已暂停，托盘仍刷新延迟"
     while (host.alive() if host else not (INSTALL_DIR / "stop.request").exists()):
         paused = not monitor_enabled()
@@ -1198,11 +1355,30 @@ def watch_loop(state: dict, host: PluginHost | None = None) -> None:
             manual_file.unlink(missing_ok=True)
         settings_error = None
         target, interval = TARGET, CHECK_INTERVAL
+        binding = None
         if host:
+            uid = PROFILE_UID
             try:
-                target, interval = load_plugin_settings()
+                target, interval, configured_uid = load_plugin_settings()
+                if configured_uid is not None:
+                    uid = configured_uid
             except GuardError as error:
                 settings_error = error
+                uid = ""
+            new_key = (uid, profile_catalog_stamp())
+            if catalog_key != new_key:
+                catalog, catalog_binding_result = profile_catalog_view(uid)
+                # A temporary parse/read failure should recover even without a file change.
+                catalog_key = new_key if catalog["available"] else None
+            binding = catalog_binding_result
+            if previous_catalog != catalog:
+                try:
+                    publish_profile_catalog(catalog)
+                    previous_catalog = catalog
+                except OSError:
+                    pass  # A concurrent menu read can delay publication until the next pass.
+            if settings_error is None and isinstance(binding, GuardError):
+                settings_error = binding
         due = last_started is None or time.monotonic() >= last_started + interval
         if manual or (due and (not paused or state.get("transaction"))):
             last_started = time.monotonic()
@@ -1224,17 +1400,22 @@ def watch_loop(state: dict, host: PluginHost | None = None) -> None:
                     state.update(failures=0, last_error_code=status, last_status=str(settings_error))
                 else:
                     if host:
-                        if state.get("plugin_target", TARGET) != target:
+                        if (state.get("plugin_target", TARGET) != target
+                                or state.get("plugin_profile_uid", PROFILE_UID) != uid):
                             state.update(failures=0, owned_reject=False, last_selected=None)
                             state.pop("pending_reload", None)
                             state.pop("last_profile_stamp", None)
                         state["plugin_target"] = target
-                        if state.get("last_error_code") == "plugin_settings_invalid":
+                        state["plugin_profile_uid"] = uid
+                        if state.get("last_error_code") in ("plugin_settings_invalid", "profile_reader_missing",
+                                "profile_unbound", "profile_unavailable", "ambiguous_profile", "profile_not_found"):
                             state.pop("last_error_code", None)
                     token = PLUGIN_TARGET.set(target if host else None)
+                    profile_token = BOUND_PROFILE.set(binding)
                     try:
                         status = recover(state, manual=True) if manual else watch_tick(state)
                     finally:
+                        BOUND_PROFILE.reset(profile_token)
                         PLUGIN_TARGET.reset(token)
                 state["last_result"] = status
                 messages = {
@@ -1268,12 +1449,14 @@ def check_status() -> dict:
     context = inspect_context()
     snapshot = ui_action("snapshot")
     state = load_state()
-    return {"ok": True, "monitor_enabled": monitor_enabled(), "profile_matches": context["profile_uid"] == PROFILE_UID,
+    target = PLUGIN_TARGET.get() or TARGET
+    present = same_scope(context) and target_available(context, target)
+    return {"ok": True, "monitor_enabled": monitor_enabled(), "profile_matches": context["profile_uid"] == bound_profile()[0],
             "mode": context["mode"], "selected": context["selected"],
-            "target_present": TARGET in context["proxies"], "bootstrap_present": BOOTSTRAP in context["proxies"],
+            "target_present": present, "bootstrap_present": bootstrap_available(context),
             "desktop_unlocked": snapshot.get("unlocked"),
             "tun_enabled": context.get("tun_enabled"), "system_proxy_enabled": context.get("system_proxy_enabled"),
-            "target_healthy": node_healthy(TARGET) if TARGET in context["proxies"] else False,
+            "target_healthy": node_healthy(target) if present else False,
             "last_result": state.get("last_result"), "last_status": state.get("last_status"),
             "last_check": state.get("last_check"), "last_check_finished": state.get("last_check_finished"),
             "last_error_code": state.get("last_error_code"),
@@ -1300,12 +1483,18 @@ def main() -> int:
     if args.core_worker:
         core_worker()
         return 0
-    if not PROFILE_UID:
-        emit({"ok": False, "code": "profile_binding_invalid", "error": "请配置本机订阅绑定 profile-binding.json"})
-        return 1
     if args.check:
         try:
-            emit(check_status())
+            target, _, uid = load_plugin_settings()
+            catalog, _ = read_profile_catalog()
+            binding = catalog_binding(catalog, PROFILE_UID if uid is None else uid)
+            target_token = PLUGIN_TARGET.set(target)
+            profile_token = BOUND_PROFILE.set(binding)
+            try:
+                emit(check_status())
+            finally:
+                BOUND_PROFILE.reset(profile_token)
+                PLUGIN_TARGET.reset(target_token)
             return 0
         except GuardError as error:
             emit({"ok": False, "code": error.code, "error": str(error)})

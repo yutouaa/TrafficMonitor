@@ -28,6 +28,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <iterator>
+#include <optional>
+#include <functional>
+#include <unordered_set>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -323,18 +326,18 @@ namespace
         bool Parse(JsonValue& out)
         {
             SkipWs();
-            if (!ParseValue(out)) return false;
+            if (!ParseValue(out, 0)) return false;
             SkipWs();
             return m_pos == m_text.size();
         }
 
     private:
-        bool ParseValue(JsonValue& v)
+        bool ParseValue(JsonValue& v, unsigned depth)
         {
-            if (m_pos >= m_text.size()) return false;
+            if (depth > 32 || m_pos >= m_text.size()) return false;
             const char c = m_text[m_pos];
-            if (c == '{') return ParseObject(v);
-            if (c == '[') return ParseArray(v);
+            if (c == '{') return ParseObject(v, depth);
+            if (c == '[') return ParseArray(v, depth);
             if (c == '"')
             {
                 v.type = JsonValue::Type::String;
@@ -346,7 +349,7 @@ namespace
             return ParseNumber(v);
         }
 
-        bool ParseObject(JsonValue& v)
+        bool ParseObject(JsonValue& v, unsigned depth)
         {
             v.type = JsonValue::Type::Object;
             ++m_pos; // {
@@ -362,7 +365,7 @@ namespace
                 ++m_pos;
                 SkipWs();
                 JsonValue child;
-                if (!ParseValue(child)) return false;
+                if (!ParseValue(child, depth + 1)) return false;
                 if (!v.object.emplace(std::move(key), std::move(child)).second) return false;
                 SkipWs();
                 if (m_pos >= m_text.size()) return false;
@@ -372,7 +375,7 @@ namespace
             }
         }
 
-        bool ParseArray(JsonValue& v)
+        bool ParseArray(JsonValue& v, unsigned depth)
         {
             v.type = JsonValue::Type::Array;
             ++m_pos; // [
@@ -382,7 +385,7 @@ namespace
             {
                 SkipWs();
                 JsonValue child;
-                if (!ParseValue(child)) return false;
+                if (!ParseValue(child, depth + 1)) return false;
                 v.array.push_back(std::move(child));
                 SkipWs();
                 if (m_pos >= m_text.size()) return false;
@@ -509,6 +512,7 @@ namespace
         std::wstring target{ default_target };
         int refresh_seconds{ 10 };
         bool valid{ false };
+        std::optional<std::string> profile_uid;
     };
 
     class SettingsWriteIdentity
@@ -583,51 +587,67 @@ namespace
         });
     }
 
+    bool IsProfileUid(const std::string& uid)
+    {
+        return !uid.empty() && uid.size() <= 128 && std::all_of(uid.begin(), uid.end(), [](char c) {
+            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        });
+    }
+
     VpnSettings ParseSettings(const std::string& json)
     {
         JsonValue root;
-        if (!JsonParser(json).Parse(root) || root.object.size() != 2)
+        if (!JsonParser(json).Parse(root))
             return {};
         const auto* target = root.Find("target_node");
         const auto* refresh = root.Find("refresh_seconds");
+        const auto* profile = root.Find("profile_uid");
         if (!target || target->type != JsonValue::Type::String ||
-            !refresh || refresh->type != JsonValue::Type::Number)
+            !refresh || refresh->type != JsonValue::Type::Number || root.object.size() != (profile ? 3 : 2) ||
+            (profile && (profile->type != JsonValue::Type::String || (!profile->str.empty() && !IsProfileUid(profile->str)))))
             return {};
         const auto name = Utf8ToWide(target->str);
         if (IsValidTarget(name, target->str))
             for (int seconds : refresh_options)
                 if (refresh->str == std::to_string(seconds))
-                    return { name, seconds, true };
+                    return { name, seconds, true, profile ? std::optional<std::string>(profile->str) : std::nullopt };
         return {};
+    }
+
+    std::string ReadLocalFile(const std::wstring& path, DWORD capacity, bool allow_prefix = false)
+    {
+        if (path.empty())
+            return {};
+        const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return {};
+        BY_HANDLE_FILE_INFORMATION info{};
+        std::string data(capacity, '\0');
+        DWORD size = 0;
+        const bool ok = GetFileInformationByHandle(file, &info)
+            && !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            && ReadFile(file, &data[0], static_cast<DWORD>(data.size()), &size, nullptr)
+            && (allow_prefix || size < data.size());
+        CloseHandle(file);
+        if (!ok)
+            return {};
+        data.resize(size);
+        return data;
     }
 
     VpnSettings LoadSettings(const std::wstring& directory)
     {
         if (directory.empty())
             return {};
-        const HANDLE file = CreateFileW((directory + L"\\plugin-settings.json").c_str(), GENERIC_READ,
-                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-        if (file == INVALID_HANDLE_VALUE)
-            return {};
-        BY_HANDLE_FILE_INFORMATION info{};
-        std::string data(4096, '\0');
-        DWORD size = 0;
-        const bool ok = GetFileInformationByHandle(file, &info)
-            && !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-            && ReadFile(file, &data[0], static_cast<DWORD>(data.size()), &size, nullptr)
-            && size < data.size();
-        CloseHandle(file);
-        if (!ok)
-            return {};
-        data.resize(size);
-        return ParseSettings(data);
+        return ParseSettings(ReadLocalFile(directory + L"\\plugin-settings.json", 4097));
     }
 
     bool SaveSettings(const std::wstring& directory, const VpnSettings& settings)
     {
         const auto target = WideToUtf8(settings.target);
         if (directory.empty() || !IsValidTarget(settings.target, target) ||
+            (settings.profile_uid && !settings.profile_uid->empty() && !IsProfileUid(*settings.profile_uid)) ||
             std::find(std::begin(refresh_options), std::end(refresh_options), settings.refresh_seconds) ==
                 std::end(refresh_options))
             return false;
@@ -644,7 +664,10 @@ namespace
             if (c == '\\' || c == '"') json += '\\';
             json += c;
         }
-        json += "\",\"refresh_seconds\":" + std::to_string(settings.refresh_seconds) + "}\n";
+        json += "\",\"refresh_seconds\":" + std::to_string(settings.refresh_seconds);
+        if (settings.profile_uid)
+            json += ",\"profile_uid\":\"" + *settings.profile_uid + '"';
+        json += "}\n";
 
         GUID unique{};
         wchar_t suffix[39]{};
@@ -697,12 +720,158 @@ namespace
         return nodes;
     }
 
+    struct Subscription
+    {
+        std::string uid;
+        std::wstring name;
+        bool ambiguous{};
+    };
+
+    struct ProfileCatalog
+    {
+        std::string current;
+        std::string selected;
+        std::vector<Subscription> items;
+        bool available{};
+    };
+
+    ProfileCatalog ParseProfileCatalog(const std::string& json)
+    {
+        JsonValue root;
+        if (!JsonParser(json).Parse(root))
+            return {};
+        using Type = JsonValue::Type;
+        const auto* available = root.Find("available");
+        const auto* current = root.Find("current");
+        const auto* selected = root.Find("selected");
+        const auto* items = root.Find("items");
+        if (!available || available->type != Type::Bool || !current || current->type != Type::String
+            || (!current->str.empty() && !IsProfileUid(current->str)) || !selected || selected->type != Type::String
+            || (!selected->str.empty() && !IsProfileUid(selected->str)) || !items || items->type != Type::Array)
+            return {};
+        ProfileCatalog result{ current->str, selected->str, {}, available->boolean };
+        if (!result.available)
+            return result;
+        std::unordered_set<std::string> uids;
+        for (const auto& row : items->array)
+        {
+            const auto* uid = row.Find("uid");
+            const auto* name = row.Find("name");
+            const auto* ambiguous = row.Find("ambiguous");
+            if (!uid || uid->type != Type::String || !IsProfileUid(uid->str) || !name || name->type != Type::String
+                || name->str.size() > 512 || !ambiguous || ambiguous->type != Type::Bool)
+                return {};
+            auto title = Utf8ToWide(name->str);
+            if (title.empty() || std::any_of(title.begin(), title.end(), [](wchar_t c) { return c < 32 || c == 127; })
+                || !uids.insert(uid->str).second)
+                return {};
+            result.items.push_back({ uid->str, std::move(title), ambiguous->boolean });
+        }
+        return result;
+    }
+
+    ProfileCatalog LoadProfileCatalog(const std::wstring& directory)
+    {
+        if (directory.empty())
+            return {};
+        return ParseProfileCatalog(ReadLocalFile(directory + L"\\profile-catalog.json", 2 * 1024 * 1024 + 1));
+    }
+
+    std::string CurrentProfileUidFromHeader(const std::string& data)
+    {
+        // shortcut: verify the single root current marker from Verge's generated header; unsupported formats disable node picking.
+        for (size_t start = data.compare(0, 3, "\xef\xbb\xbf") == 0 ? 3 : 0; start < data.size();)
+        {
+            const size_t end = data.find('\n', start);
+            if (end == std::string::npos)
+                break;
+            if (data.compare(start, 6, "items:") == 0)
+                break;
+            if (data.compare(start, 8, "current:") == 0)
+            {
+                auto line = data.substr(start + 8, end - start - 8);
+                const auto first = line.find_first_not_of(" \t\r");
+                if (first == std::string::npos)
+                    return {};
+                line = line.substr(first, line.find_last_not_of(" \t\r") - first + 1);
+                if (line.size() > 1 && (line.front() == '\'' || line.front() == '"') && line.back() == line.front())
+                    line = line.substr(1, line.size() - 2);
+                return IsProfileUid(line) ? line : std::string{};
+            }
+            start = end + 1;
+        }
+        return {};
+    }
+
+    std::string CurrentProfileUid()
+    {
+        PWSTR path = nullptr;
+        const HRESULT result = SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &path);
+        std::string uid;
+        if (SUCCEEDED(result) && path)
+            uid = CurrentProfileUidFromHeader(ReadLocalFile(std::wstring(path)
+                + L"\\io.github.clash-verge-rev.clash-verge-rev\\profiles.yaml", 4096, true));
+        CoTaskMemFree(path);
+        return uid;
+    }
+
     struct OptionsDialog
     {
         std::wstring directory;
         VpnSettings settings;
+        ProfileCatalog catalog;
+        std::string targets_profile;
         std::vector<std::wstring> targets;
+        std::vector<Subscription> profiles;
+        std::vector<std::wstring> visible_targets;
+        std::function<bool(const std::string&, const std::wstring&)> has_current_target;
     };
+
+    bool CanChooseProfile(const ProfileCatalog& catalog, const std::string& uid)
+    {
+        return catalog.available && !uid.empty() && std::any_of(catalog.items.begin(), catalog.items.end(),
+            [&](const Subscription& item) { return item.uid == uid && !item.ambiguous; });
+    }
+
+    bool CanChooseTarget(const ProfileCatalog& catalog, const std::string& uid,
+                         const std::string& targets_profile, const std::string& current)
+    {
+        return uid == catalog.current && uid == targets_profile && uid == current && CanChooseProfile(catalog, uid);
+    }
+
+    void RefreshTargetOptions(HWND hwnd, OptionsDialog& data)
+    {
+        const auto index = SendDlgItemMessageW(hwnd, IDC_VPN_PROFILE, CB_GETCURSEL, 0, 0);
+        if (index < 0 || static_cast<size_t>(index) >= data.profiles.size())
+            return;
+        const auto& profile = data.profiles[index];
+        const auto current = CurrentProfileUid();
+        const bool active = !profile.uid.empty() && profile.uid == data.catalog.current && profile.uid == current;
+        const bool has_nodes = !data.targets.empty() && CanChooseTarget(data.catalog, profile.uid, data.targets_profile, current);
+        data.visible_targets = has_nodes ? data.targets : std::vector<std::wstring>{};
+        const bool has_saved = std::find(data.visible_targets.begin(), data.visible_targets.end(), data.settings.target)
+            != data.visible_targets.end();
+        if (!has_saved)
+            data.visible_targets.insert(data.visible_targets.begin(), data.settings.target);
+        SendDlgItemMessageW(hwnd, IDC_VPN_TARGET, CB_RESETCONTENT, 0, 0);
+        for (const auto& node : data.visible_targets)
+        {
+            const LRESULT row = SendDlgItemMessageW(hwnd, IDC_VPN_TARGET, CB_ADDSTRING, 0,
+                                                   reinterpret_cast<LPARAM>(node.c_str()));
+            if (node == data.settings.target && row >= 0)
+                SendDlgItemMessageW(hwnd, IDC_VPN_TARGET, CB_SETCURSEL, row, 0);
+        }
+        EnableWindow(GetDlgItem(hwnd, IDC_VPN_TARGET), has_nodes);
+        const PCWSTR status = !data.catalog.available ? L"暂未取得订阅列表。请启动 Clash Verge，再重新打开本窗口。"
+            : profile.uid.empty() ? L"尚未选择订阅，自动恢复不会启动。"
+            : profile.ambiguous ? L"存在同名订阅。请在 Clash Verge 中修改名称。"
+            : !active ? L"请先在 Clash Verge 中启用所选订阅。"
+            : !has_nodes ? L"暂未取得此订阅的节点列表，保留已保存的目标。"
+            : !has_saved ? L"已保存的目标暂不在当前节点列表中。" : L"";
+        SetDlgItemTextW(hwnd, IDC_VPN_STATUS, !data.settings.valid
+            && GetFileAttributesW((data.directory + L"\\plugin-settings.json").c_str()) != INVALID_FILE_ATTRIBUTES
+            ? L"配置无效，保存可修复。" : status);
+    }
 
     INT_PTR CALLBACK OptionsProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
     {
@@ -710,25 +879,28 @@ namespace
         {
             auto& data = *reinterpret_cast<OptionsDialog*>(lparam);
             SetWindowLongPtrW(hwnd, DWLP_USER, lparam);
-            const bool has_nodes = !data.targets.empty();
-            auto existing = std::find(data.targets.begin(), data.targets.end(), data.settings.target);
-            if (existing == data.targets.end())
+            const auto saved = data.settings.profile_uid.value_or(data.catalog.selected);
+            data.profiles.push_back({ {}, L"未选择订阅" });
+            data.profiles.insert(data.profiles.end(), data.catalog.items.begin(), data.catalog.items.end());
+            if (!saved.empty() && std::none_of(data.profiles.begin(), data.profiles.end(),
+                [&](const Subscription& profile) { return profile.uid == saved; }))
+                data.profiles.push_back({ saved, L"已保存的订阅（暂不可用）" });
+            for (const auto& profile : data.profiles)
             {
-                data.targets.insert(data.targets.begin(), data.settings.target);
-                SetDlgItemTextW(hwnd, IDC_VPN_STATUS, has_nodes
-                    ? L"已保存的目标暂不在当前节点列表中。" : L"暂未取得节点列表，保留已保存的目标。");
+                auto label = profile.name;
+                if (!profile.uid.empty() && profile.uid == data.catalog.current)
+                    label += L"（当前）";
+                if (profile.ambiguous)
+                    label += L"（同名）";
+                const LRESULT index = SendDlgItemMessageW(hwnd, IDC_VPN_PROFILE, CB_ADDSTRING, 0,
+                                                          reinterpret_cast<LPARAM>(label.c_str()));
+                if (index >= 0 && profile.uid == saved)
+                    SendDlgItemMessageW(hwnd, IDC_VPN_PROFILE, CB_SETCURSEL, index, 0);
             }
-            if (!data.settings.valid && GetFileAttributesW((data.directory + L"\\plugin-settings.json").c_str())
-                != INVALID_FILE_ATTRIBUTES)
-                SetDlgItemTextW(hwnd, IDC_VPN_STATUS, L"配置无效，保存可修复。");
-            for (const auto& node : data.targets)
-            {
-                const LRESULT index = SendDlgItemMessageW(hwnd, IDC_VPN_TARGET, CB_ADDSTRING, 0,
-                                                          reinterpret_cast<LPARAM>(node.c_str()));
-                if (node == data.settings.target && index >= 0)
-                    SendDlgItemMessageW(hwnd, IDC_VPN_TARGET, CB_SETCURSEL, index, 0);
-            }
+            EnableWindow(GetDlgItem(hwnd, IDC_VPN_PROFILE), data.profiles.size() > 1);
+            RefreshTargetOptions(hwnd, data);
             const UINT dpi = GetDpiForWindow(hwnd);
+            SendDlgItemMessageW(hwnd, IDC_VPN_PROFILE, CB_SETDROPPEDWIDTH, MulDiv(450, dpi, 96), 0);
             SendDlgItemMessageW(hwnd, IDC_VPN_TARGET, CB_SETDROPPEDWIDTH, MulDiv(450, dpi, 96), 0);
             for (int seconds : refresh_options)
             {
@@ -747,22 +919,50 @@ namespace
             EndDialog(hwnd, IDCANCEL);
             return TRUE;
         }
-        if (LOWORD(wparam) != IDOK)
-            return FALSE;
         auto* data = reinterpret_cast<OptionsDialog*>(GetWindowLongPtrW(hwnd, DWLP_USER));
         if (!data)
             return FALSE;
+        if (LOWORD(wparam) == IDC_VPN_PROFILE && HIWORD(wparam) == CBN_SELCHANGE)
+        {
+            RefreshTargetOptions(hwnd, *data);
+            return TRUE;
+        }
+        if (LOWORD(wparam) != IDOK)
+            return FALSE;
+        const auto profile_index = SendDlgItemMessageW(hwnd, IDC_VPN_PROFILE, CB_GETCURSEL, 0, 0);
         const auto target = SendDlgItemMessageW(hwnd, IDC_VPN_TARGET, CB_GETCURSEL, 0, 0);
         const auto interval = SendDlgItemMessageW(hwnd, IDC_VPN_REFRESH, CB_GETCURSEL, 0, 0);
-        if (target < 0 || static_cast<size_t>(target) >= data->targets.size() ||
-            interval < 0 || static_cast<size_t>(interval) >= std::size(refresh_options))
+        if (profile_index < 0 || static_cast<size_t>(profile_index) >= data->profiles.size()
+            || target < 0 || static_cast<size_t>(target) >= data->visible_targets.size()
+            || interval < 0 || static_cast<size_t>(interval) >= std::size(refresh_options))
         {
             SetDlgItemTextW(hwnd, IDC_VPN_STATUS, L"请选择目标节点和刷新间隔。");
             return TRUE;
         }
-        const VpnSettings settings{ data->targets[target], refresh_options[interval] };
+        const auto& profile = data->profiles[profile_index];
+        const auto saved = data->settings.profile_uid.value_or(data->catalog.selected);
+        const bool profile_changed = !profile.uid.empty() && profile.uid != saved;
+        const bool target_changed = data->visible_targets[target] != data->settings.target;
+        if (profile_changed || target_changed)
+        {
+            const auto catalog = LoadProfileCatalog(data->directory);
+            if (profile_changed && !CanChooseProfile(catalog, profile.uid))
+            {
+                SetDlgItemTextW(hwnd, IDC_VPN_STATUS, L"所选订阅已不可用或存在同名订阅。请重新打开插件选项。");
+                return TRUE;
+            }
+            if (target_changed && (!CanChooseTarget(catalog, profile.uid, data->targets_profile, CurrentProfileUid())
+                || !data->has_current_target(profile.uid, data->visible_targets[target])))
+            {
+                SetDlgItemTextW(hwnd, IDC_VPN_STATUS, L"当前订阅或节点列表已变化。请重新打开插件选项。");
+                return TRUE;
+            }
+        }
+        VpnSettings settings{ data->visible_targets[target], refresh_options[interval], true, data->settings.profile_uid };
+        if (profile.uid != saved || !profile.uid.empty())
+            settings.profile_uid = profile.uid;
         if (data->settings.valid && settings.target == data->settings.target &&
-            settings.refresh_seconds == data->settings.refresh_seconds)
+            settings.refresh_seconds == data->settings.refresh_seconds && settings.profile_uid == data->settings.profile_uid)
         {
             EndDialog(hwnd, IDCANCEL);
             return TRUE;
@@ -1002,10 +1202,16 @@ namespace
             OptionsDialog data;
             data.directory = StateDirectory();
             data.settings = LoadSettings(data.directory);
+            data.catalog = LoadProfileCatalog(data.directory);
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
+                data.targets_profile = m_targets_profile;
                 data.targets = m_targets;
             }
+            data.has_current_target = [this](const std::string& uid, const std::wstring& target) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                return uid == m_targets_profile && std::find(m_targets.begin(), m_targets.end(), target) != m_targets.end();
+            };
             HMODULE module = nullptr;
             if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1032,7 +1238,7 @@ namespace
             case TMI_DESCRIPTION: return L"显示 Mihomo 节点延迟、VPN 虚拟网卡上下行速度与连接状态";
             case TMI_AUTHOR: return L"";
             case TMI_COPYRIGHT: return L"";
-            case TMI_VERSION: return L"1.3.0";
+            case TMI_VERSION: return L"1.4.0";
             case TMI_URL: return L"";
             default: return L"";
             }
@@ -1133,7 +1339,8 @@ namespace
             const std::wstring arguments = L"-I -B \"" + script + L"\" --plugin-watch --host-pid "
                 + std::to_wstring(pid) + L" --host-created " + std::to_wstring(created)
                 + L" --host-image \"" + image + L"\"";
-            constexpr PCWSTR pythonw = L"C:\\Python314\\pythonw.exe";
+            const std::wstring bundled_python = directory + L"\\python\\pythonw.exe";
+            const std::wstring pythonw = IsFile(bundled_python) ? bundled_python : L"C:\\Python314\\pythonw.exe";
             ULONGLONG next_launch = 0;
             while (!m_stop)
             {
@@ -1142,7 +1349,7 @@ namespace
                 {
                     next_launch = now + 60'000;
                     const HRESULT result = IsFile(pythonw) && IsFile(script) && IsFile(ui_script)
-                        ? LaunchInDesktopShell(pythonw, arguments.c_str(), directory.c_str())
+                        ? LaunchInDesktopShell(pythonw.c_str(), arguments.c_str(), directory.c_str())
                         : HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
                     if (FAILED(result))
                         ReportRecoveryLaunchError(result);
@@ -1193,12 +1400,14 @@ namespace
                 m_node_value = L"未连接";
                 m_tooltip = L"VPN: 未连接（未找到 mihomo 管道）";
                 m_targets.clear();
+                m_targets_profile.clear();
                 return;
             }
 
             std::string body;
             std::string node_utf8;
             std::vector<std::wstring> targets;
+            const auto profile_before = CurrentProfileUid();
             const bool proxies_ok = HttpGetViaPipe(pipe, "/proxies", body);
             if (proxies_ok)
             {
@@ -1214,9 +1423,19 @@ namespace
                         node_utf8 = now->str;
                 }
             }
+            const auto profile_after = CurrentProfileUid();
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                m_targets.swap(targets);
+                if (!profile_before.empty() && profile_before == profile_after)
+                {
+                    m_targets.swap(targets);
+                    m_targets_profile = profile_after;
+                }
+                else
+                {
+                    m_targets.clear();
+                    m_targets_profile.clear();
+                }
             }
 
             if (node_utf8.empty())
@@ -1349,6 +1568,7 @@ namespace
         std::mutex m_mutex;
         std::wstring m_node_value{ L"检测中..." };
         std::wstring m_tooltip{ L"VPN: 正在检测节点…" };
+        std::string m_targets_profile;
         std::vector<std::wstring> m_targets;
         CVpnNodeItem m_node_item;
         CVpnSpeedItem m_speed_item;
@@ -1395,11 +1615,18 @@ extern "C" __declspec(dllexport) void TMVPNPluginUseFixtureStateDirectory(PCWSTR
 
 extern "C" __declspec(dllexport) BOOL TMVPNPluginTestSettings(PCWSTR directory)
 {
-    const VpnSettings desired{ L"日本 \"回线\" \\ 家宽", 30, true };
+    VpnSettings desired{ L"日本 \"回线\" \\ 家宽", 30, true, std::string("test_CN-01") };
     if (!SaveSettings(directory, desired))
         return FALSE;
     const auto settings = LoadSettings(directory);
-    if (!settings.valid || settings.target != desired.target || settings.refresh_seconds != 30)
+    if (!settings.valid || settings.target != desired.target || settings.refresh_seconds != 30
+        || settings.profile_uid != desired.profile_uid)
+        return FALSE;
+    desired.profile_uid = "";
+    if (!SaveSettings(directory, desired) || LoadSettings(directory).profile_uid != desired.profile_uid)
+        return FALSE;
+    const auto legacy = ParseSettings(R"({"target_node":"Node A","refresh_seconds":10})");
+    if (!legacy.valid || legacy.profile_uid.has_value())
         return FALSE;
     const PCSTR invalid[]{
         "{\"target_node\":\"日本\",\"refresh_seconds\":30.0}",
@@ -1412,6 +1639,8 @@ extern "C" __declspec(dllexport) BOOL TMVPNPluginTestSettings(PCWSTR directory)
         "{\"target_node\":\"ＤＩＲＥＣＴ \",\"refresh_seconds\":30}",
         "{\"target_node\":\"REJECT\",\"refresh_seconds\":30}",
         "{\"target_node\":\"日本\",\"refresh_seconds\":25}",
+        "{\"target_node\":\"日本\",\"refresh_seconds\":30,\"profile_uid\":\"../private\"}",
+        "{\"target_node\":\"日本\",\"refresh_seconds\":30,\"profile_uid\":null}",
         "\xef\xbb\xbf{\"target_node\":\"日本\",\"refresh_seconds\":30}",
     };
     for (PCSTR bad : invalid)
@@ -1420,6 +1649,21 @@ extern "C" __declspec(dllexport) BOOL TMVPNPluginTestSettings(PCWSTR directory)
         if (fallback.valid || fallback.refresh_seconds != 10 || fallback.target != default_target)
             return FALSE;
     }
+    auto catalog = ParseProfileCatalog(R"({"available":true,"current":"p1","selected":"p2","items":[
+        {"uid":"p1","name":"订阅一","ambiguous":false},
+        {"uid":"p2","name":"Subscription Two","ambiguous":true}
+    ]})");
+    if (catalog.items.size() != 2 || catalog.items.front().name != L"订阅一" || catalog.selected != "p2"
+        || !CanChooseTarget(catalog, "p1", "p1", "p1") || CanChooseTarget(catalog, "p1", "p2", "p1")
+        || CanChooseTarget(catalog, "p1", "p1", "p2") || CanChooseProfile(catalog, "p2")
+        || CanChooseProfile(catalog, "missing")
+        || CurrentProfileUidFromHeader("\xef\xbb\xbf# Profiles Config for Clash Verge\r\ncurrent: 'p1'\r\nitems:\r\n") != "p1"
+        || !CurrentProfileUidFromHeader("current: ../p1\n").empty()
+        || !CurrentProfileUidFromHeader("items:\n  current: p1\n").empty())
+        return FALSE;
+    catalog.items.front().ambiguous = true;
+    if (CanChooseTarget(catalog, "p1", "p1", "p1"))
+        return FALSE;
     const std::string mock = R"json({
         "GLOBAL":{"type":"Selector","all":["日本","Node A","DIRECT","分组","子中继","PRO | 订阅专用节点AN | 0倍","日本"]},
         "日本":{"type":"Vless"},"Node A":{"type":"Shadowsocks"},

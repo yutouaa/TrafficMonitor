@@ -18,15 +18,18 @@
 
 在同一菜单的「插件选项」可以设置：
 
+- **选择订阅**：列出 Clash Verge 已导入的远程订阅，并标出当前启用的一份。先在 Clash Verge 启用要用的订阅，再选择恢复目标。保存不会替你切换订阅；同名订阅请先在 Clash Verge 中改成不同的名字。
 - **恢复目标节点**：默认 `PRO | 日本家宽S VL03 | 2倍`。保存后仅在下一次恢复时使用，不会切换当前节点。Clash 离线或已保存的节点暂时消失时，保留原选择。
 - **刷新间隔**：可选 5、10、15、30、60 秒，默认 10 秒。设置同时影响任务栏延迟测速和助手恢复检测；网速和连接状态照常刷新。
 
-选项保存在 `%LOCALAPPDATA%\ClashSubscriptionGuard\plugin-settings.json`，保存后无需重启。若文件损坏，请打开「插件选项」重新保存；在此之前助手不会发起新恢复。
+选项保存在 `%LOCALAPPDATA%\ClashSubscriptionGuard\plugin-settings.json`，订阅按 ID 保存，保存后无需重启。旧版 `profile-binding.json` 中的绑定仍可识别。若设置文件损坏，请在「插件选项」重新保存；在此之前助手不会发起新恢复。
 
 符合恢复条件时，助手先退出 Claude Desktop，检查 TUN 和系统代理，再切换到
 订阅专用节点 AN，对当前订阅执行「更新（代理）」，最后切换到本次恢复开始时的目标并确认连通。
 助手随 TrafficMonitor 启动；退出 TrafficMonitor 后不发起新恢复，进行中的恢复会完成或安全回退。
 恢复状态和日志仍位于 `%LOCALAPPDATA%\ClashSubscriptionGuard`。
+
+自动恢复要求 Clash Verge 正在使用所选订阅、处于全局模式，且订阅中有 `PRO | 订阅专用节点AN | 0倍`。不满足这些条件时仍可使用任务栏监控。
 
 ## 构建
 
@@ -35,24 +38,21 @@
 在 `build` 目录生成 `TMVPNPlugin.dll`（x64）和 `test_host.exe`。
 在插件目录运行 `C:\Python314\python.exe -B -m unittest discover -s recovery` 可执行离线回归。
 
-## 安装 / 启用
+## 安装包
+
+运行 Windows x64 安装 EXE，在开始菜单打开「TrafficMonitor VPN」。安装包包含 TrafficMonitor、插件、恢复助手和 Python，不包含 Clash Verge 或任何订阅。已有 TrafficMonitor 正在运行时，先退出旧进程，再打开此版本。只看节点和网速时无需选择订阅。
+
+从源码制作安装包需准备 MSVC x64 Build Tools、Inno Setup 和脚本要求的 Microsoft VC++ x64 运行库安装程序。提交代码后运行 `./package.ps1 -Commit HEAD`；可用 `-InnoCompiler` 和 `-VSRedist` 指定本机工具路径。打包使用指定 Git 提交中的源码。
+
+## 源码部署 / 升级旧安装
 
 1. 构建 x64 插件后，在已登录桌面的管理员 PowerShell 中运行部署脚本。首次迁移运行 `.\deploy.ps1`；已在使用带恢复助手的插件时，运行 `.\deploy.ps1 -Upgrade`。升级会备份 DLL 和恢复脚本，等待当前恢复结束并重启 TrafficMonitor，旧守护任务保持停用。可用 `.\deploy.ps1 -Rollback <备份目录>` 恢复上一版。
 2. 在任务栏窗口右键 ->「显示设置」勾选要显示的项目，
    或在 config.ini 的 [task_bar] 段写：
    plugin_display_item = vpn_node_delay（多个用逗号分隔）。
 
-恢复助手使用本机 `C:\Python314\pythonw.exe` 和系统自带的 PowerShell。
+旧安装通过本机 `C:\Python314\pythonw.exe` 运行恢复助手。源码部署前用 `C:\Python314\python.exe -m pip install PyYAML==6.0.3` 准备依赖；安装 EXE 已包含 Python 和 PyYAML。两种方式均使用系统自带的 PowerShell。
 部署沿用 TrafficMonitor 的登录自启，助手不创建独立托盘或新的登录任务。
-
-启用自动恢复前，在 `%LOCALAPPDATA%\ClashSubscriptionGuard\profile-binding.json` 中配置本机订阅：
-
-```json
-{"profile_uid":"example_profile_id","profile_name":"示例订阅"}
-```
-
-`profile_uid` 使用 Clash Verge 的 `profiles.yaml` 中对应订阅的 `uid`，
-`profile_name` 使用订阅卡片显示的名称。修改后重启 TrafficMonitor。未配置或配置无效时不会发起恢复。
 
 ## 实现说明
 

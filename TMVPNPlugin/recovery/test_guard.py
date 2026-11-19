@@ -21,6 +21,8 @@ def run_ui_selfcheck(script):
 class World:
     def __init__(self, case):
         self.case = case
+        case.enterContext(patch.object(guard, "PROFILE_UID", "fixture_primary"))
+        case.enterContext(patch.object(guard, "PROFILE_NAME", "测试订阅"))
         self.state = guard.default_state()
         self.state["last_selected"] = guard.TARGET
         self.context = {
@@ -1157,10 +1159,14 @@ function Fail([string]$Code, [string]$Message) {
 function Check-Interactive {
     if ($script:StopInput) { Fail 'user_takeover' '模拟前台切换' }
 }
+function Check-ProfileIdentity {
+    if ($script:ProfileChanged) { Fail 'user_takeover' '模拟订阅切换' }
+}
 function Find-NetworkSwitch([string]$Name) { return $script:Control }
 function New-TestControl($State, [bool]$Enabled) {
     $script:Calls = 0
     $script:StopInput = $false
+    $script:ProfileChanged = $false
     $pattern = New-Object PSObject -Property @{ Current = [pscustomobject]@{ ToggleState = $State } }
     $pattern | Add-Member -MemberType ScriptMethod -Name Toggle -Value {
         $script:Calls++
@@ -1191,12 +1197,16 @@ New-TestControl ([System.Windows.Automation.ToggleState]::Off) $true
 $script:StopInput = $true
 Expect-Failure 'user_takeover'
 if ($script:Calls -ne 0) { throw 'foreground_change_was_ignored' }
-@{ok=$true;checks=5}|ConvertTo-Json -Compress
+New-TestControl ([System.Windows.Automation.ToggleState]::Off) $true
+$script:ProfileChanged = $true
+Expect-Failure 'user_takeover'
+if ($script:Calls -ne 0) { throw 'profile_change_was_ignored' }
+@{ok=$true;checks=6}|ConvertTo-Json -Compress
 '''
         done = guard.subprocess.run([str(guard.POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", harness],
                                     capture_output=True, encoding="utf-8-sig", timeout=10, creationflags=guard.NO_WINDOW)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(guard.json.loads(done.stdout), {"ok": True, "checks": 5})
+        self.assertEqual(guard.json.loads(done.stdout), {"ok": True, "checks": 6})
 
     def test_update_error_or_timeout_rolls_back_and_cools_down(self):
         world = World(self)
